@@ -59,6 +59,12 @@ type socket struct {
 	blocks       []*block           // all blocks in the memory region
 	currentConns map[*conn]bool     // list of current connections a new block will be sent to
 	ring         uintptr            // pointer to memory region
+	pktRxCnt     C.__u32
+	blkRxCnt     C.__u32
+	pktDoneCnt   C.__u32
+	blkDoneCnt   C.__u32
+	timer        time.Time
+	timerDone    time.Time
 }
 
 // newSocket creates a new Socket object based on a config.
@@ -71,6 +77,12 @@ func newSocket(sc SocketConfig, fanoutID int, num int) (*socket, error) {
 		newBlocks:    make(chan *block),
 		currentConns: map[*conn]bool{},
 		blocks:       make([]*block, sc.NumBlocks),
+		pktRxCnt:     0,
+		blkRxCnt:     0,
+		pktDoneCnt:   0,
+		blkDoneCnt:   0,
+		timer:        time.Now(),
+		timerDone:    time.Now(),
 	}
 
 	// Compile the BPF filter, if it was requested.
@@ -140,6 +152,16 @@ func (s *socket) run() {
 			close(c.newBlocks)
 			delete(s.currentConns, c)
 		case b := <-s.newBlocks:
+			delta := time.Now().Sub(s.timer)
+			if delta.Seconds() >= 1.0 {
+				s.timer = time.Now()
+				log.Printf("pkts rx rate: %d pkts/sec", s.pktRxCnt)
+				log.Printf("blks rx rate: %d blks/sec", s.blkRxCnt)
+				s.pktRxCnt = 0
+				s.blkRxCnt = 0
+			}
+			s.blkRxCnt++
+			s.pktRxCnt += b.cblock().num_pkts
 			// a new block is avaiable, send it out to all clients
 			for c, _ := range s.currentConns {
 				b.ref()
@@ -292,6 +314,16 @@ func (b *block) unref() {
 	refs := atomic.AddInt32(&b.r, -1)
 	vlog.VUp(5, 1, "%v unref = %d", b, refs)
 	if refs == 0 {
+		delta := time.Now().Sub(b.s.timerDone)
+		if delta.Seconds() >= 1.0 {
+			b.s.timerDone = time.Now()
+			log.Printf("pkts done rate: %d pkts/sec", b.s.pktDoneCnt)
+			log.Printf("blks done rate: %d blks/sec", b.s.blkDoneCnt)
+			b.s.pktDoneCnt = 0
+			b.s.blkDoneCnt = 0
+		}
+		b.s.blkDoneCnt++
+		b.s.pktDoneCnt += b.cblock().num_pkts
 		b.clear()
 	} else if refs < 0 {
 		panic(fmt.Sprintf("invalid unref of %v to %d", b, refs))
